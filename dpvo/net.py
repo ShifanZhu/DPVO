@@ -1,3 +1,19 @@
+"""
+VONet - Visual Odometry Network
+
+This file implements the neural network architecture from the DPVO paper.
+The network consists of two main components:
+
+1. Patchifier: Extracts features and samples patches from images
+2. Update: Recurrent update operator that refines optical flow predictions
+
+Key Architecture Components (from DPVO paper Section 3.1):
+- Feature Extraction: ResNet-based encoder
+- Patch Sampling: Random selection (surprisingly effective!)
+- Update Operator: GRU-based with correlation, 1D-conv, and message passing
+- Factor Head: Predicts flow corrections (delta) and confidence weights
+"""
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,12 +38,36 @@ from . import projective_ops as pops
 autocast = torch.cuda.amp.autocast
 import matplotlib.pyplot as plt
 
-DIM = 384
+DIM = 384  # Context feature dimension (hidden state size)
+
 
 class Update(nn.Module):
+    """
+    Update Operator - Recurrent module for iterative refinement
+
+    This implements the update operator from DPVO paper Fig. 4.
+    Architecture components:
+    1. Temporal 1D Convolutions (c1, c2)
+    2. SoftMax Aggregation / Message Passing (agg_kk, agg_ij)
+    3. Transition Block (gru)
+    4. Factor Head (d, w)
+
+    The update operator predicts:
+    - delta: 2D flow corrections [E, 2]
+    - weight: confidence weights [E, 2] in range (0, 1)
+
+    Where E = number of edges in the patch graph.
+    """
+
     def __init__(self, p):
+        """
+        Args:
+            p: Patch size (default 3 for 3x3 patches)
+        """
         super(Update, self).__init__()
 
+        # 1D Temporal Convolutions
+        # Process information along patch trajectories through time
         self.c1 = nn.Sequential(
             nn.Linear(DIM, DIM),
             nn.ReLU(inplace=True),
@@ -37,12 +77,17 @@ class Update(nn.Module):
             nn.Linear(DIM, DIM),
             nn.ReLU(inplace=True),
             nn.Linear(DIM, DIM))
-        
+
         self.norm = nn.LayerNorm(DIM, eps=1e-3)
 
+        # SoftMax Aggregation (Message Passing)
+        # agg_kk: aggregate over edges with same source patch
+        # agg_ij: aggregate over edges with same (src_frame, dst_frame) pair
         self.agg_kk = SoftAgg(DIM)
         self.agg_ij = SoftAgg(DIM)
 
+        # Transition Block (GRU)
+        # Two gated residual units for updating hidden state
         self.gru = nn.Sequential(
             nn.LayerNorm(DIM, eps=1e-3),
             GatedResidual(DIM),
@@ -50,6 +95,8 @@ class Update(nn.Module):
             GatedResidual(DIM),
         )
 
+        # Correlation Feature Encoder
+        # Process correlation volumes (2 pyramid levels × 7×7 grid × p×p patch)
         self.corr = nn.Sequential(
             nn.Linear(2*49*p*p, DIM),
             nn.ReLU(inplace=True),
@@ -59,36 +106,71 @@ class Update(nn.Module):
             nn.Linear(DIM, DIM),
         )
 
+        # Factor Head - Delta (flow corrections)
+        # Predicts 2D displacement for each edge
         self.d = nn.Sequential(
             nn.ReLU(inplace=False),
             nn.Linear(DIM, 2),
-            GradientClip())
+            GradientClip())  # Prevents gradient explosion
 
+        # Factor Head - Weight (confidence)
+        # Predicts confidence in range (0, 1) via sigmoid
         self.w = nn.Sequential(
             nn.ReLU(inplace=False),
             nn.Linear(DIM, 2),
             GradientClip(),
-            nn.Sigmoid())
+            nn.Sigmoid())  # Bounded to (0, 1)
 
 
     def forward(self, net, inp, corr, flow, ii, jj, kk):
-        """ update operator """
+        """
+        Forward pass of the update operator
 
+        Args:
+            net: Hidden state [1, E, DIM] for each edge
+            inp: Context features [1, E, DIM]
+            corr: Correlation features [1, E, 2*49*p*p]
+            flow: Not used (for compatibility)
+            ii: Source frame indices [E]
+            jj: Destination frame indices [E]
+            kk: Patch indices [E]
+
+        Returns:
+            net: Updated hidden state [1, E, DIM]
+            (delta, weight, None): Predictions
+                - delta: Flow corrections [1, E, 2]
+                - weight: Confidence weights [1, E, 2]
+                - None: Placeholder
+
+        Processing Flow:
+        net ← net + inp + corr_encoded      # Inject new information
+        net ← net + temporal_convs(net)      # Temporal context
+        net ← net + message_passing(net)     # Spatial context
+        net ← gru(net)                       # Update hidden state
+        delta, weight ← factor_heads(net)    # Predict outputs
+        """
+
+        # Inject correlation and context into hidden state
         net = net + inp + self.corr(corr)
         net = self.norm(net)
 
+        # 1D Temporal Convolutions
+        # Find neighbors along each patch trajectory (t-1, t, t+1)
         ix, jx = fastba.neighbors(kk, jj)
         mask_ix = (ix >= 0).float().reshape(1, -1, 1)
         mask_jx = (jx >= 0).float().reshape(1, -1, 1)
 
-        net = net + self.c1(mask_ix * net[:,ix])
-        net = net + self.c2(mask_jx * net[:,jx])
+        net = net + self.c1(mask_ix * net[:,ix])  # Backward neighbor
+        net = net + self.c2(mask_jx * net[:,jx])  # Forward neighbor
 
-        net = net + self.agg_kk(net, kk)
-        net = net + self.agg_ij(net, ii*12345 + jj)
+        # SoftMax Aggregation (Message Passing)
+        net = net + self.agg_kk(net, kk)                  # Same patch
+        net = net + self.agg_ij(net, ii*12345 + jj)       # Same frame pair
 
+        # Transition block (update hidden state)
         net = self.gru(net)
 
+        # Factor heads (predict delta and weight)
         return net, (self.d(net), self.w(net), None)
 
 

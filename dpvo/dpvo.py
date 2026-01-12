@@ -1,3 +1,20 @@
+"""
+Deep Patch Visual Odometry (DPVO) - Main System
+
+This file implements the core DPVO system from the papers:
+- "Deep Patch Visual Odometry" (NeurIPS 2023)
+- "Deep Patch Visual SLAM" (arXiv 2024)
+
+Key Components:
+1. Patch Graph: Sparse scene representation using 3x3 patches
+2. Update Operator: Recurrent network for iterative refinement
+3. Bundle Adjustment: Differentiable optimization layer
+4. Loop Closure: Optional SLAM backend (proximity + classical)
+
+The system processes video frames to estimate camera poses and 3D structure
+by tracking sparse patches through time using deep learned features.
+"""
+
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -12,69 +29,109 @@ from .utils import *
 
 mp.set_start_method('spawn', True)
 
-
+# Automatic mixed precision context manager for faster inference
 autocast = torch.cuda.amp.autocast
+# Identity transformation in SE(3) Lie group
 Id = SE3.Identity(1, device="cuda")
 
 
 class DPVO:
+    """
+    Main DPVO class - implements visual odometry/SLAM system
+
+    Architecture:
+    - Processes frames one at a time in __call__()
+    - Maintains a sliding window of keyframes (buffer)
+    - Tracks sparse 3x3 patches using correlation volumes
+    - Iteratively refines poses and depths via update operator + BA
+    - Optional loop closure for drift correction (SLAM mode)
+    """
 
     def __init__(self, cfg, network, ht=480, wd=640, viz=False):
+        """
+        Initialize DPVO system
+
+        Args:
+            cfg: Configuration object with hyperparameters
+            network: VONet neural network (or path to checkpoint)
+            ht: Input image height (default 480)
+            wd: Input image width (default 640)
+            viz: Enable real-time 3D visualization (default False)
+
+        Key Parameters (from cfg):
+            PATCHES_PER_FRAME: Number of patches per frame (default 96)
+            BUFFER_SIZE: Max number of keyframes to keep (default 2048)
+            OPTIMIZATION_WINDOW: Local BA window size (default 10)
+            LOOP_CLOSURE: Enable proximity loop closure (default False)
+            CLASSIC_LOOP_CLOSURE: Enable DBoW2 backend (default False)
+        """
         self.cfg = cfg
         self.load_weights(network)
-        self.is_initialized = False
-        self.enable_timing = False
+        self.is_initialized = False  # True after 8 frames processed
+        self.enable_timing = False   # For profiling/debugging
         torch.set_num_threads(2)
 
+        # M = patches per frame, N = buffer size (max keyframes)
         self.M = self.cfg.PATCHES_PER_FRAME
         self.N = self.cfg.BUFFER_SIZE
 
         self.ht = ht    # image height
         self.wd = wd    # image width
 
-        DIM = self.DIM
-        RES = self.RES
+        DIM = self.DIM  # Context feature dimension (384)
+        RES = self.RES  # Resolution divisor (4)
 
-        ### state attributes ###
-        self.tlist = []
-        self.counter = 0
+        ### State Attributes ###
+        self.tlist = []      # List of timestamps
+        self.counter = 0     # Total frames processed (including non-keyframes)
 
-        # keep track of global-BA calls
+        # Track global-BA calls to avoid redundant optimization
         self.ran_global_ba = np.zeros(100000, dtype=bool)
 
+        # Feature map resolution (1/4 of input due to network downsampling)
         ht = ht // RES
         wd = wd // RES
 
-        # dummy image for visualization
+        # Dummy image for visualization updates
         self.image_ = torch.zeros(self.ht, self.wd, 3, dtype=torch.uint8, device="cpu")
 
-        ### network attributes ###
+        ### Network Attributes - Mixed Precision ###
+        # Using half precision (FP16) significantly speeds up inference
         if self.cfg.MIXED_PRECISION:
             self.kwargs = kwargs = {"device": "cuda", "dtype": torch.half}
         else:
             self.kwargs = kwargs = {"device": "cuda", "dtype": torch.float}
 
-        ### frame memory size ###
-        self.pmem = self.mem = 36 # 32 was too small given default settings
+        ### Frame Memory Size ###
+        # pmem: patch memory (how many frames worth of patches to store)
+        # mem: frame memory (how many frames worth of features to store)
+        self.pmem = self.mem = 36  # 32 was too small for default settings
         if self.cfg.LOOP_CLOSURE:
-            self.last_global_ba = -1000 # keep track of time since last global opt
-            self.pmem = self.cfg.MAX_EDGE_AGE # patch memory
+            self.last_global_ba = -1000  # Track time since last global optimization
+            self.pmem = self.cfg.MAX_EDGE_AGE  # Store more patches for loop closure
 
+        # Context features for each patch (used by update operator)
+        # Shape: [pmem, M, DIM] = [36, 96, 384]
         self.imap_ = torch.zeros(self.pmem, self.M, DIM, **kwargs)
+
+        # Matching features for each patch (used for correlation)
+        # Shape: [pmem, M, 128, P, P] = [36, 96, 128, 3, 3]
         self.gmap_ = torch.zeros(self.pmem, self.M, 128, self.P, self.P, **kwargs)
 
+        # Patch graph: stores poses, patches, edges, and factors
         self.pg = PatchGraph(self.cfg, self.P, self.DIM, self.pmem, **kwargs)
 
-        # classic backend
+        # Classical loop closure backend (DBoW2 + DISK features)
         if self.cfg.CLASSIC_LOOP_CLOSURE:
             self.load_long_term_loop_closure()
 
+        # Feature pyramid for correlation volumes
+        # Level 1: 1/4 resolution, Level 2: 1/16 resolution
         self.fmap1_ = torch.zeros(1, self.mem, 128, ht // 1, wd // 1, **kwargs)
         self.fmap2_ = torch.zeros(1, self.mem, 128, ht // 4, wd // 4, **kwargs)
-
-        # feature pyramid
         self.pyramid = (self.fmap1_, self.fmap2_)
 
+        # Optional real-time 3D viewer
         self.viewer = None
         if viz:
             self.start_viewer()
@@ -198,16 +255,59 @@ class DPVO:
         return poses, tstamps
 
     def corr(self, coords, indicies=None):
-        """ local correlation volume """
+        """
+        Compute correlation volumes for patch matching
+
+        This implements Equation 4 from the DPVO paper:
+        C(u,v,α,β) = ⟨g(u,v), f(P'(u,v) + Δ_αβ)⟩
+
+        For each patch-frame edge (k,j):
+        1. Sample a 7×7 grid around the reprojected patch center
+        2. Compute dot products between patch features and frame features
+        3. Creates a correlation volume showing visual similarity
+
+        Args:
+            coords: Reprojected patch coordinates [1, E, 3, 3, 2]
+            indicies: Optional (ii, jj) edge indices
+
+        Returns:
+            Correlation features [1, E, 2*3*3*7*7] (2 pyramid levels)
+
+        Note: Uses custom CUDA kernel (altcorr) for efficiency
+        """
         ii, jj = indicies if indicies is not None else (self.pg.kk, self.pg.jj)
-        ii1 = ii % (self.M * self.pmem)
-        jj1 = jj % (self.mem)
+        ii1 = ii % (self.M * self.pmem)  # Wrap around patch buffer
+        jj1 = jj % (self.mem)            # Wrap around frame buffer
+
+        # Level 1: 1/4 resolution (radius=3 → 7x7 grid)
         corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
+        # Level 2: 1/16 resolution (radius=3 → 7x7 grid)
         corr2 = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3)
+
         return torch.stack([corr1, corr2], -1).view(1, len(ii), -1)
 
     def reproject(self, indicies=None):
-        """ reproject patch k from i -> j """
+        """
+        Reproject patches from source frame to target frame
+
+        Implements Equation 2 from the DPVO paper:
+        P'_kj ∼ K·T_j·T_i^(-1)·K^(-1)·P_k
+
+        Where:
+        - P_k is patch k from frame i (3x3 grid with depth)
+        - T_i, T_j are camera poses (SE3)
+        - K is camera intrinsics
+        - P'_kj is the reprojection into frame j
+
+        Args:
+            indicies: Optional (ii, jj, kk) tuple specifying:
+                      ii = source frame indices
+                      jj = destination frame indices
+                      kk = patch indices
+
+        Returns:
+            Reprojected coordinates [1, E, 3, 3, 2] where E = num edges
+        """
         (ii, jj, kk) = indicies if indicies is not None else (self.pg.ii, self.pg.jj, self.pg.kk)
         coords = pops.transform(SE3(self.poses), self.patches, self.intrinsics, ii, jj, kk)
         return coords.permute(0, 1, 4, 2, 3).contiguous()
@@ -326,35 +426,81 @@ class DPVO:
         self.ran_global_ba[self.n] = True
 
     def update(self):
+        """
+        Core update step - runs one iteration of the update operator + BA
+
+        This is the heart of DPVO, alternating between:
+        1. Network Update: Predict flow corrections (delta) and weights
+        2. Bundle Adjustment: Optimize poses and depths
+
+        Corresponds to Section 3.1 of the DPVO paper.
+
+        Flow:
+        ┌─────────────┐
+        │  Reproject  │  Project patches using current pose/depth estimates
+        └──────┬──────┘
+               │
+        ┌──────▼──────┐
+        │ Correlation │  Compute visual similarities (Eq. 4)
+        └──────┬──────┘
+               │
+        ┌──────▼──────┐
+        │   Update    │  Neural network predicts:
+        │  Operator   │  - delta: 2D flow corrections [E, 2]
+        └──────┬──────┘  - weight: confidence weights [E, 2]
+               │
+        ┌──────▼──────┐
+        │   Bundle    │  Optimize poses T and depths d to minimize:
+        │ Adjustment  │  ||ω_ij(T,P_k) - [P'_kj + δ_kj]||²_Σ (Eq. 6)
+        └─────────────┘
+
+        The update operator uses:
+        - Correlation features (visual alignment)
+        - Context features (semantic information)
+        - Hidden state (temporal consistency via GRU)
+        """
         with Timer("other", enabled=self.enable_timing):
+            # Step 1: Reproject all patches using current pose/depth estimates
             coords = self.reproject()
 
             with autocast(enabled=True):
+                # Step 2: Compute correlation volumes (visual similarity)
                 corr = self.corr(coords)
+
+                # Step 3: Get context features for each patch
                 ctx = self.imap[:, self.pg.kk % (self.M * self.pmem)]
+
+                # Step 4: Run update operator (recurrent network)
+                # Updates hidden state and predicts flow corrections
                 self.pg.net, (delta, weight, _) = \
                     self.network.update(self.pg.net, ctx, corr, None, self.pg.ii, self.pg.jj, self.pg.kk)
 
-            lmbda = torch.as_tensor([1e-4], device="cuda")
+            lmbda = torch.as_tensor([1e-4], device="cuda")  # Damping factor for BA
             weight = weight.float()
+
+            # Target = where patches should be after applying corrections
             target = coords[...,self.P//2,self.P//2] + delta.float()
 
+        # Store factors for bundle adjustment
         self.pg.target = target
         self.pg.weight = weight
 
         with Timer("BA", enabled=self.enable_timing):
             try:
-                # run global bundle adjustment if there exist long-range edges
+                # Decide between global BA (all edges) vs local BA (recent edges)
+                # Global BA runs when loop closure edges exist
                 if (self.pg.ii < self.n - self.cfg.REMOVAL_WINDOW - 1).any() and not self.ran_global_ba[self.n]:
                     self.__run_global_BA()
                 else:
+                    # Local BA: optimize only recent frames (sliding window)
                     t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
                     t0 = max(t0, 1)
-                    fastba.BA(self.poses, self.patches, self.intrinsics, 
+                    fastba.BA(self.poses, self.patches, self.intrinsics,
                         target, weight, lmbda, self.pg.ii, self.pg.jj, self.pg.kk, t0, self.n, M=self.M, iterations=2, eff_impl=False)
             except:
                 print("Warning BA failed...")
 
+            # Update 3D point cloud for visualization
             points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
             points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
             self.pg.points_[:len(points)] = points[:]
@@ -375,99 +521,171 @@ class DPVO:
             torch.arange(max(self.n-r, 0), self.n, device="cuda"), indexing='ij')
 
     def __call__(self, tstamp, image, intrinsics):
-        """ track new frame """
+        """
+        Main entry point: Process a new video frame
 
+        This is called once per input frame and handles:
+        1. Feature extraction (patchify)
+        2. Pose initialization (motion model)
+        3. Edge creation (patch graph connectivity)
+        4. Update operator + BA
+        5. Keyframing (remove redundant frames)
+        6. Loop closure (optional)
+
+        Args:
+            tstamp: Frame timestamp (integer or float)
+            image: RGB image tensor [H, W, 3], uint8
+            intrinsics: Camera intrinsics [fx, fy, cx, cy]
+
+        System States:
+        - Not initialized (n < 8): Accumulate frames, check for motion
+        - Initializing (n == 8): Run 12 update iterations
+        - Running (n > 8): Single update + keyframing per frame
+
+        Frame Flow:
+        ┌────────────┐
+        │  Patchify  │ Extract features + randomly sample patches
+        └─────┬──────┘
+              │
+        ┌─────▼──────┐
+        │ Init Pose  │ Use damped linear motion model
+        └─────┬──────┘
+              │
+        ┌─────▼──────┐
+        │ Add Edges  │ Connect patches to nearby frames
+        └─────┬──────┘
+              │
+        ┌─────▼──────┐
+        │   Update   │ Network + BA (see update() method)
+        └─────┬──────┘
+              │
+        ┌─────▼──────┐
+        │ Keyframe?  │ Remove frames with low motion
+        └────────────┘
+        """
+
+        # Classical loop closure: add frame to DBoW2 database
         if self.cfg.CLASSIC_LOOP_CLOSURE:
             self.long_term_lc(image, self.n)
 
+        # Check buffer overflow
         if (self.n+1) >= self.N:
             raise Exception(f'The buffer size is too small. You can increase it using "--opts BUFFER_SIZE={self.N*2}"')
 
+        # Update visualization
         if self.viewer is not None:
             self.viewer.update_image(image.contiguous())
 
+        # Normalize image to [-0.5, 0.5]
         image = 2 * (image[None,None] / 255.0) - 0.5
-        
+
+        # === STEP 1: Feature Extraction & Patch Sampling ===
+        # See DPVO paper Section 3, Fig. 2
         with autocast(enabled=self.cfg.MIXED_PRECISION):
             fmap, gmap, imap, patches, _, clr = \
                 self.network.patchify(image,
-                    patches_per_image=self.cfg.PATCHES_PER_FRAME, 
-                    centroid_sel_strat=self.cfg.CENTROID_SEL_STRAT, 
+                    patches_per_image=self.cfg.PATCHES_PER_FRAME,
+                    centroid_sel_strat=self.cfg.CENTROID_SEL_STRAT,
                     return_color=True)
+            # fmap: frame features [1, 128, H/4, W/4] - for correlation
+            # gmap: patch features [M, 128, 3, 3] - matching features
+            # imap: context features [M, 384] - for update operator
+            # patches: initial patch locations [M, 3, 3, 3] (x, y, depth)
+            # clr: patch colors [M, 3] - for visualization
 
-        ### update state attributes ###
+        ### Update State Attributes ###
         self.tlist.append(tstamp)
         self.pg.tstamps_[self.n] = self.counter
         self.pg.intrinsics_[self.n] = intrinsics / self.RES
 
-        # color info for visualization
+        # Store patch colors (RGB -> BGR for visualization)
         clr = (clr[0,:,[2,1,0]] + 0.5) * (255.0 / 2)
         self.pg.colors_[self.n] = clr.to(torch.uint8)
 
+        # Update indexing structures
         self.pg.index_[self.n + 1] = self.n + 1
         self.pg.index_map_[self.n + 1] = self.m + self.M
 
+        # === STEP 2: Pose Initialization ===
+        # Use damped linear motion model: predict pose from previous motion
         if self.n > 1:
             if self.cfg.MOTION_MODEL == 'DAMPED_LINEAR':
-                P1 = SE3(self.pg.poses_[self.n-1])
-                P2 = SE3(self.pg.poses_[self.n-2])
+                P1 = SE3(self.pg.poses_[self.n-1])  # Previous pose
+                P2 = SE3(self.pg.poses_[self.n-2])  # Two frames ago
 
-                # To deal with varying camera hz
+                # Handle varying camera framerates
                 *_, a,b,c = [1]*3 + self.tlist
-                fac = (c-b) / (b-a)
+                fac = (c-b) / (b-a)  # Time ratio
 
+                # Compute velocity in SE(3) tangent space, apply damping
                 xi = self.cfg.MOTION_DAMPING * fac * (P1 * P2.inv()).log()
-                tvec_qvec = (SE3.exp(xi) * P1).data
+                tvec_qvec = (SE3.exp(xi) * P1).data  # Extrapolate
                 self.pg.poses_[self.n] = tvec_qvec
             else:
+                # Constant velocity: just copy previous pose
                 tvec_qvec = self.poses[self.n-1]
                 self.pg.poses_[self.n] = tvec_qvec
 
-        # TODO better depth initialization
+        # === STEP 3: Depth Initialization ===
+        # Initialize patch inverse depths
         patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
         if self.is_initialized:
+            # Use median depth from recent patches (more stable)
             s = torch.median(self.pg.patches_[self.n-3:self.n,:,2])
             patches[:,:,2] = s
 
         self.pg.patches_[self.n] = patches
 
-        ### update network attributes ###
+        ### Store Network Features ###
+        # Use circular buffers (% operator wraps around)
         self.imap_[self.n % self.pmem] = imap.squeeze()
         self.gmap_[self.n % self.pmem] = gmap.squeeze()
         self.fmap1_[:, self.n % self.mem] = F.avg_pool2d(fmap[0], 1, 1)
         self.fmap2_[:, self.n % self.mem] = F.avg_pool2d(fmap[0], 4, 4)
 
-        self.counter += 1        
+        self.counter += 1
+
+        # === Motion Check (Pre-initialization) ===
+        # Ensure sufficient camera motion before starting optimization
         if self.n > 0 and not self.is_initialized:
-            if self.motion_probe() < 2.0:
+            if self.motion_probe() < 2.0:  # Less than 2 pixels median flow
+                # Skip this frame (not enough motion)
                 self.pg.delta[self.counter - 1] = (self.counter - 2, Id[0])
                 return
 
+        # Increment frame and patch counters
         self.n += 1
         self.m += self.M
 
+        # === STEP 4: Loop Closure (DPV-SLAM) ===
+        # Add proximity-based loop closure edges (Section 3.2 of DPV-SLAM paper)
         if self.cfg.LOOP_CLOSURE:
             if self.n - self.last_global_ba >= self.cfg.GLOBAL_OPT_FREQ:
-                """ Add loop closure factors """
                 lii, ljj = self.pg.edges_loop()
                 if lii.numel() > 0:
                     self.last_global_ba = self.n
                     self.append_factors(lii, ljj)
 
-        # Add forward and backward factors
+        # === STEP 5: Add Odometry Edges ===
+        # Forward: recent patches → current frame
+        # Backward: current patches → recent frames
         self.append_factors(*self.__edges_forw())
         self.append_factors(*self.__edges_back())
 
+        # === STEP 6: Optimization ===
         if self.n == 8 and not self.is_initialized:
+            # Initialization: 8 frames accumulated, run 12 iterations
             self.is_initialized = True
-
             for itr in range(12):
                 self.update()
 
         elif self.is_initialized:
+            # Normal operation: single update + keyframing
             self.update()
             self.keyframe()
 
+        # === STEP 7: Classical Loop Closure (Optional) ===
+        # DBoW2-based global optimization (Section 3.3 of DPV-SLAM paper)
         if self.cfg.CLASSIC_LOOP_CLOSURE:
             self.long_term_lc.attempt_loop_closure(self.n)
             self.long_term_lc.lc_callback()
